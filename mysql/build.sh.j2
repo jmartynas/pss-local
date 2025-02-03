@@ -1,0 +1,49 @@
+#!/bin/bash
+
+# Set variables from environment or defaults
+{% set MYSQL_ROOT_PASSWORD = MYSQL_ROOT_PASSWORD or 'pass' %}
+{% set MYSQL_REPLICATION_USER = MYSQL_REPLICATION_USER or 'repl' %}
+{% set MYSQL_REPLICATION_PASSWORD = MYSQL_REPLICATION_PASSWORD or 'slave' %}
+{% set SLAVE_COUNT = SLAVE_COUNT or 2 %}
+{% set SLAVE_NAME = SLAVE_NAME or 'mysql' %}
+{% set MASTER_NAME = 'mysql_master' %}
+{% set COMPOSE_FILE = COMPOSE_FILE or 'docker-compose.yml' %}
+
+docker-compose -f {{ COMPOSE_FILE }} down -v
+docker-compose -f {{ COMPOSE_FILE }} up -d
+
+# Wait for master to be ready
+until docker exec {{ MASTER_NAME }} sh -c 'mysql -u root -p{{ MYSQL_ROOT_PASSWORD }} -h 127.0.0.1 -P 3306 -e ";"'
+do
+    echo "Waiting for master database connection..."
+    sleep 4
+done
+echo "Master is ready!"
+
+# Wait for slave containers
+for i in $(seq 1 {{ SLAVE_COUNT }}); do
+    CURRENT_HOST="{{ SLAVE_NAME }}_$i"
+    until docker exec $CURRENT_HOST sh -c 'mysql -u root -p{{ MYSQL_ROOT_PASSWORD }} -h 127.0.0.1 -P 3306 -e ";"'
+    do
+        echo "Waiting for $CURRENT_HOST database connection..."
+        sleep 4
+    done
+    echo "$CURRENT_HOST is ready!"
+done
+
+# Set up replication user on the master
+priv_stmt="CREATE USER '{{ MYSQL_REPLICATION_USER }}'@'%' IDENTIFIED BY '{{ MYSQL_REPLICATION_PASSWORD }}'; GRANT REPLICATION SLAVE ON *.* TO '{{ MYSQL_REPLICATION_USER }}'@'%'; FLUSH PRIVILEGES;"
+docker exec {{ MASTER_NAME }} sh -c "mysql -u root -p{{ MYSQL_ROOT_PASSWORD }} -h 127.0.0.1 -P 3306 -e '$priv_stmt'"
+
+# Set replication for each slave
+for i in $(seq 1 {{ SLAVE_COUNT }}); do
+    CURRENT_HOST="{{ SLAVE_NAME }}_$i"
+    MS_STATUS=`docker exec {{ MASTER_NAME }} sh -c 'mysql -u root -p{{ MYSQL_ROOT_PASSWORD }} -h 127.0.0.1 -P 3306 -e "SHOW MASTER STATUS"'`
+    CURRENT_LOG=`echo $MS_STATUS | awk '{print $6}'`
+    CURRENT_POS=`echo $MS_STATUS | awk '{print $7}'`
+
+    start_slave_stmt="CHANGE MASTER TO MASTER_HOST='{{ MASTER_NAME }}',MASTER_USER='{{ MYSQL_REPLICATION_USER }}',MASTER_PASSWORD='{{ MYSQL_REPLICATION_PASSWORD }}',MASTER_LOG_FILE='$CURRENT_LOG',MASTER_LOG_POS=$CURRENT_POS; START SLAVE;"
+    start_slave_cmd="mysql -u root -p{{ MYSQL_ROOT_PASSWORD }} -h 127.0.0.1 -P 3306 -e \"$start_slave_stmt\""
+    docker exec $CURRENT_HOST sh -c "$start_slave_cmd"
+done
+

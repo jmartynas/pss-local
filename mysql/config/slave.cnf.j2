@@ -1,0 +1,10 @@
+[mysqld]
+skip-name-resolve
+default_authentication_plugin = mysql_native_password
+
+server-id = {{ slave_id }}  # Each slave gets a unique ID
+log_bin = 1
+relay_log = mysql-relay-bin
+binlog_do_db = {{ MYSQL_DATABASE }}
+read_only = 1  # Prevents accidental writes on slaves
+
