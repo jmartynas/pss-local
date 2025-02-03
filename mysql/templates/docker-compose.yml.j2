@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  mysql-master:
+    image: mysql:latest
+    container_name: {{ master_name }}
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: {{ root_password }}
+      MYSQL_DATABASE: {{ database }}
+      MYSQL_USER: {{ user }}
+      MYSQL_PASSWORD: {{ password }}
+    ports:
+      - "3306:3306"
+    volumes:
+      - ../mysql_data/master:/var/lib/mysql
+      - ../master.cnf:/etc/mysql/my.cnf
+      - ../master.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - mysql-cluster
+
+{% for i in range(1, num_slaves + 1) %}
+  mysql-slave-{{ i }}:
+    image: mysql:latest
+    container_name: {{ slave_name_prefix }}-{{ i }}
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: {{ root_password }}
+      MYSQL_DATABASE: {{ database }}
+      MYSQL_USER: {{ user }}
+      MYSQL_PASSWORD: {{ password }}
+    ports:
+      - "330{{ i }}:3306"
+    volumes:
+      - ../mysql_data/slave-{{ i }}:/var/lib/mysql
+      - ./my-{{ i }}.cnf:/etc/mysql/my.cnf
+      - ../slave.sql:/docker-entrypoint-initdb.d/init.sql
+    depends_on:
+        - {{ master_name }}
+    networks:
+      - mysql-cluster
+{% endfor %}
+
+networks:
+  mysql-cluster:
+    driver: bridge
+
