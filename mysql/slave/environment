@@ -1,0 +1,8 @@
+# Note, by default mysql root does not have a password. You need to restart a server to bring MYSQL_ROOT_PASSWORD working. Use "docker-compose restart" command.
+MYSQL_ROOT_PASSWORD=pass
+MYSQL_ROOT_HOST=%
+MYSQL_USER=user
+MYSQL_PASSWORD=pass
+MYSQL_DATABASE=pss
+MYSQL_PORT=3307
+MYSQL_LOWER_CASE_TABLE_NAMES=0

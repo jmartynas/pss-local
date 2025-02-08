@@ -1,0 +1,207 @@
+---
+- name: Set up MySQL replication docker containers and execute migrations
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "../vars/mysql_replication_config.yml"  # Ensure this is the correct path
+  tasks:
+
+    # 1. Ensure certificate directory exists
+    - name: Ensure certificate directory exists
+      file:
+        path: "{{ certs_path }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+
+    # 2. Generate a new private key for MySQL certificate
+    - name: Generate a new private key for MySQL certificate
+      community.crypto.openssl_privatekey:
+        path: "{{ certs_path }}/mysql-key.pem"
+        size: 2048
+        type: RSA
+        state: present
+      delegate_to: localhost
+
+    # 3. Remove existing certificate file if it exists
+    - name: Remove existing certificate file if it exists
+      become: true
+      file:
+        path: "{{ certs_path }}/mysql-cert.pem"
+        state: absent
+      delegate_to: localhost
+
+    # 4. Generate self-signed certificate for MySQL (cert + key)
+    - name: Generate self-signed certificate for MySQL (cert + key)
+      become: true
+      community.crypto.x509_certificate:
+        path: "{{ certs_path }}/mysql-cert.pem"
+        privatekey_path: "{{ certs_path }}/mysql-key.pem"
+        provider: selfsigned
+        selfsigned_not_before: "20250208000000Z"  # Format: YYYYMMDDHHMMSSZ
+        selfsigned_not_after:  "20300208000000Z"  # Format: YYYYMMDDHHMMSSZ
+        selfsigned_digest: "sha256"
+        force: true
+        unsafe_writes: true
+        state: present
+        setype: ""
+        seuser: ""
+        serole: ""
+      delegate_to: localhost
+
+    # 5. Set certificate file permissions
+    - name: Set certificate file permissions
+      become: true
+      file:
+        path: "{{ certs_path }}/mysql-cert.pem"
+        owner: fyzikas
+        group: fyzikas
+        mode: "0644"
+
+    # 6. Ensure destination directory for master.cnf exists
+    - name: Ensure destination directory for master.cnf exists
+      file:
+        path: "{{ certs_path }}/configs"
+        state: directory
+        mode: '0755'
+
+    # 7. Copy MySQL master configuration
+    - name: Copy MySQL master configuration
+      copy:
+        src: "../files/master.cnf"  # Ensure this path is correct
+        dest: "{{ certs_path }}/configs/master.cnf"
+        mode: "0644"
+
+    # 8. Generate MySQL slave configurations dynamically
+    - name: Generate MySQL slave configurations dynamically
+      template:
+        src: "../templates/slave.cnf.j2"
+        dest: "{{ certs_path }}/configs/slave_{{ item }}.cnf"
+        mode: "0644"
+      loop: "{{ range(1, num_slaves+1)|list }}"
+
+    # 9. Define and create a Docker network
+    - name: Create Docker network
+      community.docker.docker_network:
+        name: mysql_network
+        driver: bridge
+      register: network
+
+    # 10. Create the master MySQL container
+    - name: Create the master MySQL container
+      community.docker.docker_container:
+        name: "{{ master_container_name }}"
+        image: "{{ mysql_image }}"
+        state: started
+        env:
+          MYSQL_ROOT_PASSWORD: "{{ mysql_root_password }}"
+        volumes:
+          - "{{ certs_path }}/configs/master.cnf:/etc/mysql/my.cnf"
+          - "{{ certs_path }}:/etc/mysql/certs"
+          - "../migrations:/docker-entrypoint-initdb.d"  # Mount migrations directory here
+        restart_policy: always
+        published_ports:
+          - "{{ master_host_port }}:3306"
+        networks:
+          - name: mysql_network
+      register: master_container
+
+    # 11. Wait for master MySQL to be ready
+    - name: Wait for master MySQL to be ready
+      wait_for:
+        host: "{{ master_host_ip }}"
+        port: "{{ master_host_port }}"
+        state: started
+        delay: 5
+        timeout: 60
+
+    # 12. Create the slave MySQL containers
+    - name: Create the slave MySQL containers
+      community.docker.docker_container:
+        name: "mysql_slave_{{ item }}"
+        image: "{{ mysql_image }}"
+        state: started
+        env:
+          MYSQL_ROOT_PASSWORD: "{{ mysql_root_password }}"
+        volumes:
+          - "{{ certs_path }}/configs/slave_{{ item }}.cnf:/etc/mysql/my.cnf"
+          - "{{ certs_path }}:/etc/mysql/certs"
+        restart_policy: always
+        published_ports:
+          - "{{ slave_ports[item-1] }}:3306"
+        networks:
+          - name: mysql_network
+      loop: "{{ range(1, num_slaves+1)|list }}"
+      register: slave_containers
+
+    # 13. Get master status (binary log file and position)
+    - name: Get master status (binary log file and position)
+      shell: >
+        docker exec {{ master_container_name }} mysql -uroot -p{{ mysql_root_password }} -h 127.0.0.1 -P 3306 -e "SHOW MASTER STATUS\G"
+      register: master_status
+      changed_when: false
+
+    # 14. Extract master log file and position from output (only if master_status is defined)
+    - name: Extract master log file and position from output
+      set_fact:
+        master_log_file: "{{ master_status.stdout_lines | select('search', 'File:') | map('regex_replace', 'File:\\s+', '') | list | first | default('') }}"
+        master_log_pos: "{{ master_status.stdout_lines | select('search', 'Position:') | map('regex_replace', 'Position:\\s+', '') | list | first | default(0) }}"
+      when: master_status is defined and master_status.stdout_lines | length > 0
+
+    - name: Wait for MySQL server to be up on slave {{ item }}
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ slave_ports[item-1] }}"
+        state: started
+        delay: 10
+        timeout: 180
+      loop: "{{ range(1, num_slaves + 1) | list }}"
+
+    # 15. Check replication status on slave {{ item }}
+    - name: Check replication status on slave {{ item }}
+      shell: >
+        docker exec mysql_slave_{{ item }} mysql -uroot -ppass -h mysql_slave_{{ item }} -e "SHOW SLAVE STATUS\G"
+      register: slave_status
+      loop: "{{ range(1, num_slaves+1)|list }}"
+      changed_when: false
+
+    # 16. Skip replication configuration if already set on slave {{ item }}
+    - name: Skip replication configuration if already set on slave {{ item }}
+      debug:
+        msg: "Replication already configured on slave {{ item }}"
+      when: >
+        "'Slave_IO_Running: Yes' in slave_status.results[item - 1].stdout" and
+        "'Slave_SQL_Running: Yes' in slave_status.results[item - 1].stdout"
+      loop: "{{ range(1, num_slaves+1)|list }}"
+
+    # 17. Stop slave I/O thread on slave {{ item }}
+    - name: Stop slave I/O thread on slave {{ item }}
+      shell: >
+        docker exec mysql_slave_{{ item }} mysql -uroot -ppass -e "STOP SLAVE IO_THREAD FOR CHANNEL '';"
+      loop: "{{ range(1, num_slaves+1)|list }}"
+      when: >
+        "'Slave_IO_Running: No' in slave_status.results[item - 1].stdout"
+
+    # 18. Configure replication on slave {{ item }}
+    - name: Configure replication on slave {{ item }}
+      shell: >
+        docker exec mysql_slave_{{ item }} mysql -uroot -ppass -e "
+        CHANGE MASTER TO
+            MASTER_HOST='mysql_master',
+            MASTER_USER='{{ mysql_replication_user }}',
+            MASTER_PASSWORD='{{ mysql_replication_password }}',
+            MASTER_LOG_FILE='{{ master_log_file }}',
+            MASTER_LOG_POS={{ master_log_pos }};
+        START SLAVE;"
+      loop: "{{ range(1, num_slaves+1)|list }}"
+      when: >
+        "'Slave_IO_Running: No' in slave_status.results[item - 1].stdout"
+
+    # 19. Start slave I/O thread on slave {{ item }}
+    - name: Start slave I/O thread on slave {{ item }}
+      shell: >
+        docker exec mysql_slave_{{ item }} mysql -uroot -ppass -e "START SLAVE IO_THREAD FOR CHANNEL '';"
+      loop: "{{ range(1, num_slaves+1)|list }}"
+      when: >
+        "'Slave_IO_Running: No' in slave_status.results[item - 1].stdout"
+
