@@ -1,5 +1,2 @@
-mysql/docker-compose.yml
-mysql/master_data
-mysql/slave1_data
-mysql/slave2_data
 mysql/.venv/
+mysql/ansible.cfg

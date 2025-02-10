@@ -1,56 +1,100 @@
----
-- name: Perform MySQL failover if master is down
+- name: Handle MySQL Master Failover
   hosts: localhost
-  gather_facts: false
   vars_files:
-    - "../vars/mysql_replication_config.yml"
+    - ../vars/mysql_replication_config.yml
+  vars:
+    ansible_python_interpreter: /home/fyzikas/git-repos/passenger-search-system/pss-local/tmp/.venv/bin/python3
+
   tasks:
+    # Step 1: Check if Master is Running
+    - name: Check if MySQL Master Container is Running
+      community.docker.docker_container_info:
+        name: "{{ master_container_name }}"
+      register: master_status
 
-  - name: Check if master container is running
-    shell: "docker ps -q -f name={{ master_container_name }}"
-    register: master_running
-    changed_when: false
+    # Step 2: If Master is Down, Promote the Most Updated Slave
+    - name: Promote the Most Updated Slave to Master
+      when: master_status.container is not defined or not master_status.container.State.Running
+      block:
+        # Stop replication on all available slaves
+        - name: Stop Replication on All Slaves
+          ansible.builtin.shell: |
+            mysql -u root -p{{ mysql_root_password }} -e "STOP REPLICA; RESET REPLICA ALL;"
+          args:
+            executable: /bin/bash
+          delegate_to: "{{ item }}"
+          loop: "{{ slave_host_ips }}"
 
-  - name: Failover: Promote a slave if master is not running
-    block:
-      - name: Select a slave to promote as new master
-        set_fact:
-          new_master: "mysql_slave_1"   # For example; you can add logic to select dynamically
+        # Find the Most Updated Slave by Checking Binary Log Positions
+        - name: Get Log Positions from All Slaves
+          ansible.builtin.shell: |
+            mysql -u root -p{{ mysql_root_password }} -e "SHOW REPLICA STATUS\G" | grep "Exec_Master_Log_Pos" | awk '{print $2}'
+          args:
+            executable: /bin/bash
+          delegate_to: "{{ item }}"
+          register: log_positions
+          loop: "{{ slave_host_ips }}"
 
-      - name: Promote the selected slave to master (stop replication)
-        shell: >
-          docker exec {{ new_master }} mysql -uroot -p{{ mysql_root_password }} -e "
-          STOP SLAVE;
-          RESET SLAVE ALL;
-          RESET MASTER;"
-        args:
-          warn: false
+        # Set the Most Updated Slave as the New Master
+        - name: Determine the Most Updated Slave
+          set_fact:
+            new_master: "{{ slave_host_ips | zip(log_positions.results) | sort(attribute='1.stdout', reverse=True) | first | first }}"
 
-      - name: (Optional) Rename the promoted slave container to be the new master
-        shell: >
-          docker rename {{ new_master }} new_master
-        args:
-          warn: false
+        - name: Promote New Master
+          ansible.builtin.shell: |
+            mysql -u root -p{{ mysql_root_password }} -e "
+            RESET MASTER;
+            SET GLOBAL server_id=1;
+            CREATE USER IF NOT EXISTS '{{ mysql_replication_user }}'@'%' IDENTIFIED WITH mysql_native_password BY '{{ mysql_replication_password }}';
+            GRANT REPLICATION SLAVE ON *.* TO '{{ mysql_replication_user }}'@'%';
+            FLUSH PRIVILEGES;"
+          args:
+            executable: /bin/bash
+          delegate_to: "{{ new_master }}"
 
-      - name: Reconfigure the other slaves to use the new master
-        shell: >
-          docker exec {{ item }} mysql -uroot -p{{ mysql_root_password }} -e "
-          CHANGE MASTER TO MASTER_HOST='{{ master_host_ip }}', MASTER_USER='{{ mysql_replication_user }}', MASTER_PASSWORD='{{ mysql_replication_password }}';
-          START SLAVE;"
-        loop: "{{ slave_containers.results | map(attribute='Name') | list }}"
-        when: item != new_master
+        - name: Restart Promoted Master
+          ansible.builtin.shell: systemctl restart mysql
+          delegate_to: "{{ new_master }}"
 
-      - name: Spin up a new slave container
-        community.docker.docker_container:
-          name: "mysql_slave_new"
-          image: "{{ mysql_image }}"
-          state: started
-          env:
-            MYSQL_ROOT_PASSWORD: "{{ mysql_root_password }}"
-          volumes:
-            - "{{ certs_path }}:/etc/mysql/certs"
-          restart_policy: always
-          published_ports:
-            - "{{ new_slave_port }}:3306"
-    when: master_running.stdout == ""
+    # Step 3: Reconfigure All Other Slaves to Follow New Master
+    - name: Reconfigure Other Slaves to Follow New Master
+      when: item != new_master
+      ansible.builtin.shell: |
+        mysql -u root -p{{ mysql_root_password }} -e "
+        CHANGE REPLICATION SOURCE TO
+          SOURCE_HOST='{{ new_master }}',
+          SOURCE_USER='{{ mysql_replication_user }}',
+          SOURCE_PASSWORD='{{ mysql_replication_password }}',
+          SOURCE_LOG_FILE='mysql-bin.000001',
+          SOURCE_LOG_POS=4;
+        START REPLICA;"
+      args:
+        executable: /bin/bash
+      delegate_to: "{{ item }}"
+      loop: "{{ slave_host_ips }}"
+
+    # Step 4: If No Slaves Available, Deploy New Master from Backup
+    - name: Deploy New Master if No Slaves Are Available
+      when: new_master is not defined or new_master == ""
+      block:
+        - name: Start New Master Container
+          community.docker.docker_container:
+            name: "{{ master_container_name }}"
+            image: "{{ mysql_image }}"
+            restart_policy: always
+            env:
+              MYSQL_ROOT_PASSWORD: "{{ mysql_root_password }}"
+            ports:
+              - "{{ master_host_port }}:3306"
+            volumes:
+              - "mysql_master_data:/var/lib/mysql"
+            networks:
+              - name: mysql_network
+
+        - name: Restore Backup to New Master
+          ansible.builtin.shell: |
+            mysql -u root -p{{ mysql_root_password }} < /backup/latest.sql
+          args:
+            executable: /bin/bash
+          delegate_to: "{{ master_host_ip }}"
 

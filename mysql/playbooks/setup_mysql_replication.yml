@@ -2,8 +2,6 @@
   hosts: localhost
   vars_files:
     - ../vars/mysql_replication_config.yml
-  vars:
-    ansible_python_interpreter: /home/fyzikas/git-repos/passenger-search-system/pss-local/tmp/.venv/bin/python3
 
   tasks:
     # Pull MySQL Docker Image

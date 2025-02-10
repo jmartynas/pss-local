@@ -1,0 +1,6 @@
+requests
+docker
+ansible
+pymysql
+jinja2
+pyyaml
