@@ -8,3 +8,7 @@ venv:
 	. .venv/bin/activate && pip install -r requirements.txt
 	@echo "\033[1;32mTo activate virtual environment run 'source .venv/bin/activate' command.\033[0m" 
 	@echo "\033[1;32mTo deactivate virtual environment run 'deactivate' command.\033[0m" 
+
+.PHONY: clean
+clean:
+	rm -rf .venv
