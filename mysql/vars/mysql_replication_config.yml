@@ -1,0 +1,31 @@
+# Number of MySQL slave instances
+num_slaves: 2
+
+# MySQL Docker image
+mysql_image: mysql:8.0
+
+database_name: pss
+
+# Master MySQL settings
+master_container_name: mysql_master
+master_host_ip: "127.0.0.1"      # Use your actual Docker or network IP
+master_host_port: 3307           # Published port for master MySQL
+
+# Slave settings (ensure the number of ports matches num_slaves)
+slave_host_ips:
+  - 127.0.0.1
+  - 127.0.0.1
+slave_ports:
+  - 3308
+  - 3309
+
+# Credentials
+mysql_root_password: "pass"
+mysql_replication_user: "repl"
+mysql_replication_password: "pass"
+mysql_replication_db: "pss"
+
+# SSL settings (optional)
+certs_path: "/tmp/mysql-certs"
+mysql_common_name: "mysql.local"
+
