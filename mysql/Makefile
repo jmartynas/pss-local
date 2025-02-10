@@ -2,10 +2,6 @@
 run:
 	ansible-playbook playbooks/setup_mysql_replication.yml --ask-become-pass
 
-.PHONY: failover
-failover:
-	ansible-playbook playbooks/setup_mysql_replication.yml --ask-become-pass
-
 .PHONY: venv
 venv:
 	python3 -m venv .venv
