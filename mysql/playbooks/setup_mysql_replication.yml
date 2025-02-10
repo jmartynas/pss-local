@@ -1,0 +1,163 @@
+- name: "Setup MySQL Master-Slave Replication with Docker"
+  hosts: localhost
+  vars_files:
+    - ../vars/mysql_replication_config.yml
+  vars:
+    ansible_python_interpreter: /home/fyzikas/git-repos/passenger-search-system/pss-local/tmp/.venv/bin/python3
+
+  tasks:
+    # Pull MySQL Docker Image
+    - name: Pull MySQL Docker Image
+      community.docker.docker_image:
+        name: "{{ mysql_image }}"
+        source: pull
+
+    # Create MySQL Network
+    - name: Create MySQL Network
+      community.docker.docker_network:
+        name: mysql_network
+        state: present
+
+    # Create MySQL Master Volume
+    - name: Create MySQL Master Volume
+      community.docker.docker_volume:
+        name: mysql_master_data
+        state: present
+
+    # Create and run MySQL Master Container with Config File
+    - name: Ensure MySQL Master Container is Running
+      community.docker.docker_container:
+        name: "{{ master_container_name }}"
+        image: "{{ mysql_image }}"
+        restart_policy: always
+        env:
+          MYSQL_ROOT_PASSWORD: "{{ mysql_root_password }}"
+        ports:
+          - "{{ master_host_port }}:3306"
+        volumes:
+          - mysql_master_data:/var/lib/mysql
+          - ../files/master.cnf:/etc/mysql/my.cnf
+        networks:
+          - name: mysql_network
+
+    # Wait for MySQL to be Ready on Master
+    - name: Wait for MySQL Master to be Ready
+      ansible.builtin.wait_for:
+        host: "{{ master_host_ip }}"
+        port: "{{ master_host_port }}"
+        state: started
+        timeout: 300
+        delay: 10
+        connect_timeout: 5
+
+    - name: Get binary log file and position from master
+      mysql_query:
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+        login_host: "{{ master_host_ip }}"
+        login_port: "{{ master_host_port }}"
+        query: "SHOW MASTER STATUS"
+      register: master_status
+    
+    - name: Set primary log file and position
+      set_fact:
+        primary_log_file: "{{ master_status.query_result[0][0].File }}"
+        primary_log_pos: "{{ master_status.query_result[0][0].Position }}"
+      when: master_status.query_result | length > 0
+
+    # Configure MySQL Master for Replication
+    - name: Configure MySQL Master for Replication
+      ansible.builtin.shell: |
+        mysql -u root -p{{ mysql_root_password }} -h {{ master_host_ip }} -P {{ master_host_port }} -e "
+          CREATE DATABASE IF NOT EXISTS {{ mysql_replication_db }};
+          CREATE USER IF NOT EXISTS '{{ mysql_replication_user }}'@'%' IDENTIFIED WITH mysql_native_password BY '{{ mysql_replication_password }}';
+          GRANT REPLICATION SLAVE ON *.* TO '{{ mysql_replication_user }}'@'%';
+          FLUSH PRIVILEGES;"
+      become: true
+      environment:
+        MYSQL_PWD: "{{ mysql_root_password }}"
+      notify: Enable Replication on Master
+
+    # Create MySQL Slave Containers with Config File
+    - name: Render slave.cnf for each slave
+      template:
+        src: "../templates/slave.cnf.j2"
+        dest: "/tmp/slave_{{ item }}.cnf"
+      loop: "{{ range(1, num_slaves + 1) | list }}"
+
+    - name: Ensure MySQL Slave Containers are Running
+      community.docker.docker_container:
+        name: "mysql_slave_{{ item }}"
+        image: "{{ mysql_image }}"
+        restart_policy: always
+        env:
+          MYSQL_ROOT_PASSWORD: "{{ mysql_root_password }}"
+          MYSQL_REPLICATION_USER: "{{ mysql_replication_user }}"
+          MYSQL_REPLICATION_PASSWORD: "{{ mysql_replication_password }}"
+        ports:
+          - "{{ slave_ports[item | int - 1] }}:3306"
+        volumes:
+          - "mysql_slave_{{ item }}_data:/var/lib/mysql"
+          - "/tmp/slave_{{ item }}.cnf:/etc/mysql/my.cnf"
+        networks:
+          - name: mysql_network
+      loop: "{{ range(1, num_slaves + 1) | list }}"
+
+    # Wait for MySQL to be Ready on Slaves
+    - name: Wait for MySQL to be Ready on Slaves
+      ansible.builtin.wait_for:
+        host: "{{ slave_host_ips[item | int - 1] }}"
+        port: "{{ slave_ports[item | int - 1] }}"
+        state: started
+        timeout: 300
+        delay: 10
+        connect_timeout: 5
+      loop: "{{ range(1, num_slaves + 1) | list }}"
+
+    # Ensure 'pss' Database Exists on Slaves
+    - name: Ensure 'pss' Database Exists on Slaves
+      mysql_db:
+        name: pss
+        state: present
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+        login_host: "{{ slave_host_ips[item | int - 1] }}"
+        login_port: "{{ slave_ports[item | int - 1] }}"
+      loop: "{{ range(1, num_slaves + 1) | list }}"
+
+    # Setup MySQL Replication on Slaves
+    - name: Setup MySQL Replication on Slaves
+      mysql_replication:
+        mode: changereplication
+        primary_host: "mysql_master"
+        primary_port: 3306
+        primary_user: "{{ mysql_replication_user }}"
+        primary_password: "{{ mysql_replication_password }}"
+        primary_log_file: "{{ primary_log_file }}"
+        primary_log_pos: "{{ primary_log_pos }}"
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+        login_host: "{{ item.0 }}"
+        login_port: "{{ item.1 }}"
+      loop: "{{ slave_host_ips | zip(slave_ports) | list }}"
+      when: slave_host_ips is defined and slave_ports is defined
+
+    - name: Start MySQL Replication on Slaves
+      ansible.builtin.shell:
+        mysql -u root -p{{ mysql_root_password }} -h {{ item.0 }} -P {{ item.1 }} -e "START SLAVE;"
+      environment:
+        MYSQL_PWD: "{{ mysql_root_password }}"
+      loop: "{{ slave_host_ips | zip(slave_ports) | list }}"
+      when: slave_host_ips is defined and slave_ports is defined
+      
+  handlers:
+    - name: Enable Replication on Master
+      mysql_replication:
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+        master_host: "{{ master_host_ip }}"
+        master_user: "{{ mysql_replication_user }}"
+        master_password: "{{ mysql_replication_password }}"
+        mode: startreplica
+        login_host: "{{ master_host_ip }}"
+        login_port: "{{ master_host_port }}"

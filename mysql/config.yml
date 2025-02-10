@@ -1,8 +1,0 @@
-master_name: mysql-master
-slave_name_prefix: mysql-slave
-num_slaves: 3
-root_password: pass
-database: pss
-user: user
-password: pass
-host_data_dir: /var/lib/mysql_data

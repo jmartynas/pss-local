@@ -1,0 +1,10 @@
+[mysqld]
+server-id=1
+log-bin=mysql-bin
+binlog_format=ROW
+sync_binlog=1
+innodb_flush_log_at_trx_commit=1
+
+skip-ssl
+require_secure_transport = OFF
+default_authentication_plugin = mysql_native_password

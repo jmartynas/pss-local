@@ -1,0 +1,56 @@
+---
+- name: Perform MySQL failover if master is down
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - "../vars/mysql_replication_config.yml"
+  tasks:
+
+  - name: Check if master container is running
+    shell: "docker ps -q -f name={{ master_container_name }}"
+    register: master_running
+    changed_when: false
+
+  - name: Failover: Promote a slave if master is not running
+    block:
+      - name: Select a slave to promote as new master
+        set_fact:
+          new_master: "mysql_slave_1"   # For example; you can add logic to select dynamically
+
+      - name: Promote the selected slave to master (stop replication)
+        shell: >
+          docker exec {{ new_master }} mysql -uroot -p{{ mysql_root_password }} -e "
+          STOP SLAVE;
+          RESET SLAVE ALL;
+          RESET MASTER;"
+        args:
+          warn: false
+
+      - name: (Optional) Rename the promoted slave container to be the new master
+        shell: >
+          docker rename {{ new_master }} new_master
+        args:
+          warn: false
+
+      - name: Reconfigure the other slaves to use the new master
+        shell: >
+          docker exec {{ item }} mysql -uroot -p{{ mysql_root_password }} -e "
+          CHANGE MASTER TO MASTER_HOST='{{ master_host_ip }}', MASTER_USER='{{ mysql_replication_user }}', MASTER_PASSWORD='{{ mysql_replication_password }}';
+          START SLAVE;"
+        loop: "{{ slave_containers.results | map(attribute='Name') | list }}"
+        when: item != new_master
+
+      - name: Spin up a new slave container
+        community.docker.docker_container:
+          name: "mysql_slave_new"
+          image: "{{ mysql_image }}"
+          state: started
+          env:
+            MYSQL_ROOT_PASSWORD: "{{ mysql_root_password }}"
+          volumes:
+            - "{{ certs_path }}:/etc/mysql/certs"
+          restart_policy: always
+          published_ports:
+            - "{{ new_slave_port }}:3306"
+    when: master_running.stdout == ""
+
