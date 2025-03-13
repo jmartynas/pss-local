@@ -80,7 +80,7 @@
     - name: Render slave.cnf for each slave
       template:
         src: "../templates/slave.cnf.j2"
-        dest: "/tmp/slave_{{ item }}.cnf"
+        dest: "../tmp/slave_{{ item }}.cnf"
       loop: "{{ range(1, num_slaves + 1) | list }}"
 
     - name: Ensure MySQL Slave Containers are Running
@@ -96,7 +96,7 @@
           - "{{ slave_ports[item | int - 1] }}:3306"
         volumes:
           - "mysql_slave_{{ item }}_data:/var/lib/mysql"
-          - "/tmp/slave_{{ item }}.cnf:/etc/mysql/my.cnf"
+          - "../tmp/slave_{{ item }}.cnf:/etc/mysql/my.cnf"
         networks:
           - name: mysql_network
       loop: "{{ range(1, num_slaves + 1) | list }}"
